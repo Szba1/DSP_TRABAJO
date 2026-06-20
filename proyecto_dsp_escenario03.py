@@ -126,6 +126,88 @@ print(buffer_stats.to_string())
 print("\n-> NOTA: El stock_aserrado tiene una acumulación masiva, lo que confirma que el Secado es el cuello de botella (ya que su Utilización es altísima y su ciclo de 27.8 hrs es muy lento).")
 
 
+# =====================================================================
+# 5. PROPUESTA DE MEJORA CUANTIFICADA
+# =====================================================================
+print("\nCuantificando propuesta de mejora: agregar capacidad de Secado...")
+print("Escenario what-if: agregar una capacidad equivalente adicional de Secado.")
+print("Importante: esta es una cota estimada con tasas historicas; no es una nueva simulacion.")
+
+improvement_summary = pd.DataFrame()
+scenario_production = {}
+products_for_improvement = ['P1', 'P2', 'P3']
+
+if 'BLOCKED' not in pivot_states.columns:
+    pivot_states['BLOCKED'] = 0
+
+aserradero_state_rows = pivot_states[pivot_states['station'] == 'aserradero']
+aserradero_blocked_h = aserradero_state_rows['BLOCKED'].sum()
+aserradero_busy_h = aserradero_state_rows['BUSY'].sum()
+aserradero_batches = batches_valid[batches_valid['station'] == 'aserradero'].copy()
+aserradero_output_total = aserradero_batches['volume_out_m3'].sum()
+
+if aserradero_busy_h > 0 and aserradero_output_total > 0:
+    aserradero_rate_m3_h = aserradero_output_total / aserradero_busy_h
+    extra_aserradero_output_total = aserradero_blocked_h * aserradero_rate_m3_h
+
+    aserradero_output_by_product = (
+        aserradero_batches.groupby('product')['volume_out_m3']
+        .sum()
+        .reindex(products_for_improvement, fill_value=0)
+    )
+    product_mix_aserradero = aserradero_output_by_product / aserradero_output_total
+
+    finished_output_by_product = (
+        product_outputs_valid.groupby('product')['volume_m3']
+        .sum()
+        .reindex(products_for_improvement, fill_value=0)
+    )
+    terminal_yield = (
+        finished_output_by_product / aserradero_output_by_product.replace(0, np.nan)
+    ).fillna(0)
+
+    extra_finished_by_product = extra_aserradero_output_total * product_mix_aserradero * terminal_yield
+    current_finished_avg = finished_output_by_product / num_replications
+    extra_finished_avg = extra_finished_by_product / num_replications
+    scenario_finished_avg = current_finished_avg + extra_finished_avg
+    scenario_production = scenario_finished_avg.to_dict()
+
+    improvement_summary = pd.DataFrame({
+        'Producto': products_for_improvement,
+        'Produccion_actual_m3': current_finished_avg.values,
+        'Produccion_adicional_estimada_m3': extra_finished_avg.values,
+        'Produccion_escenario_m3': scenario_finished_avg.values,
+    })
+
+    total_current = current_finished_avg.sum()
+    total_extra = extra_finished_avg.sum()
+    total_scenario = scenario_finished_avg.sum()
+    total_increase_pct = (total_extra / total_current) * 100 if total_current > 0 else 0
+
+    secado_output_total = batches_valid[batches_valid['station'] == 'secado']['volume_out_m3'].sum()
+    extra_material_to_secado = extra_aserradero_output_total * product_mix_aserradero[['P2', 'P3']].sum()
+    secado_extra_capacity_use = (
+        (extra_material_to_secado / secado_output_total) * 100
+        if secado_output_total > 0 else 0
+    )
+
+    print(f"Horas bloqueadas observadas en Aserradero: {aserradero_blocked_h/num_replications:,.2f} h promedio por replica")
+    print(f"Tasa observada del Aserradero en BUSY: {aserradero_rate_m3_h:,.2f} m3/h")
+    print(improvement_summary.to_string(
+        index=False,
+        formatters={
+            'Produccion_actual_m3': '{:,.2f}'.format,
+            'Produccion_adicional_estimada_m3': '{:,.2f}'.format,
+            'Produccion_escenario_m3': '{:,.2f}'.format,
+        }
+    ))
+    print(f"Aumento total estimado: {total_extra:,.2f} m3 por replica ({total_increase_pct:.2f}%).")
+    print(f"Produccion total estimada con mejora: {total_scenario:,.2f} m3 por replica.")
+    print(f"La capacidad adicional de Secado usaria aprox. {secado_extra_capacity_use:.2f}% de una capacidad equivalente actual para absorber P2/P3 extra.")
+else:
+    print("No hay datos suficientes para estimar la mejora de capacidad de Secado.")
+
+
 print("\n\n==========================================================")
 print("  FASE 2: OPTIMIZACIÓN LOGÍSTICA (PROBLEMA DE TRANSPORTE)")
 print("==========================================================\n")
@@ -241,5 +323,201 @@ if res.success:
     
     print("-" * 50)
     print(f"COSTO LOGÍSTICO TOTAL MÍNIMO: $ {res.fun:,.0f} CLP")
+
+    # =====================================================================
+    # COMPARACION CON HEURISTICA DE REFERENCIA
+    # =====================================================================
+    print("\nComparacion con heuristica de referencia: minimos y destino factible mas cercano")
+
+    heuristic_allocations = []
+    heuristic_cost = 0.0
+    heuristic_feasible = True
+
+    for p in products:
+        product_supply = production[p]
+        product_bounds = bounds_dict[p]
+        min_required = sum(lb for lb, _ in product_bounds.values())
+        max_capacity = sum(ub for _, ub in product_bounds.values())
+
+        if product_supply < min_required:
+            print(f"ADVERTENCIA: {p} produce {product_supply:,.2f} m3, bajo el minimo requerido de {min_required:,.2f} m3.")
+            heuristic_feasible = False
+            continue
+
+        if product_supply > max_capacity:
+            print(f"ADVERTENCIA: {p} produce {product_supply:,.2f} m3, sobre la capacidad maxima de {max_capacity:,.2f} m3.")
+            heuristic_feasible = False
+            continue
+
+        product_allocation = {d: 0.0 for d in product_bounds}
+
+        for d, (lower_bound, _) in product_bounds.items():
+            product_allocation[d] = lower_bound
+
+        remaining_volume = product_supply - min_required
+        sorted_destinations = sorted(product_bounds, key=lambda d: distances[d])
+
+        for d in sorted_destinations:
+            _, upper_bound = product_bounds[d]
+            available_capacity = upper_bound - product_allocation[d]
+            assigned_volume = min(remaining_volume, available_capacity)
+
+            if assigned_volume > 0:
+                product_allocation[d] += assigned_volume
+                remaining_volume -= assigned_volume
+
+            if remaining_volume <= 1e-6:
+                break
+
+        if remaining_volume > 1e-6:
+            print(f"ADVERTENCIA: La heuristica no pudo asignar {remaining_volume:,.2f} m3 de {p}.")
+            heuristic_feasible = False
+
+        for d, volume in product_allocation.items():
+            if volume > 0.01:
+                route_cost = volume * 100 * distances[d]
+                heuristic_cost += route_cost
+                heuristic_allocations.append({
+                    'Producto': p,
+                    'Destino': d,
+                    'Volumen_m3': volume,
+                    'Distancia_km': distances[d],
+                    'Costo_CLP': route_cost,
+                })
+
+    if heuristic_allocations:
+        heuristic_plan = pd.DataFrame(heuristic_allocations)
+        print("\nPlan heuristico de referencia:")
+        print(heuristic_plan.to_string(
+            index=False,
+            formatters={
+                'Volumen_m3': '{:,.2f}'.format,
+                'Distancia_km': '{:.1f}'.format,
+                'Costo_CLP': '$ {:,.0f}'.format,
+            }
+        ))
+
+        heuristic_totals = heuristic_plan.groupby('Producto')['Volumen_m3'].sum()
+        for p in products:
+            shipped_volume = heuristic_totals.get(p, 0.0)
+            if abs(shipped_volume - production[p]) > 1e-4:
+                print(f"ADVERTENCIA: La heuristica envio {shipped_volume:,.2f} m3 de {p}, pero la produccion es {production[p]:,.2f} m3.")
+                heuristic_feasible = False
+
+        for _, row in heuristic_plan.iterrows():
+            lower_bound, upper_bound = bounds_dict[row['Producto']][row['Destino']]
+            if row['Volumen_m3'] < lower_bound - 1e-4 or row['Volumen_m3'] > upper_bound + 1e-4:
+                print(
+                    f"ADVERTENCIA: La heuristica viola limites en {row['Producto']} - {row['Destino']} "
+                    f"({row['Volumen_m3']:,.2f} m3 fuera de [{lower_bound:,.2f}, {upper_bound:,.2f}])."
+                )
+                heuristic_feasible = False
+
+        optimal_cost = res.fun
+        cost_difference = heuristic_cost - optimal_cost
+        gap_pct = (cost_difference / optimal_cost) * 100 if optimal_cost > 0 else 0
+
+        print("-" * 50)
+        print(f"COSTO HEURISTICO DE REFERENCIA: $ {heuristic_cost:,.0f} CLP")
+        print(f"COSTO OPTIMO: $ {optimal_cost:,.0f} CLP")
+        print(f"DIFERENCIA HEURISTICA - OPTIMO: $ {cost_difference:,.0f} CLP ({gap_pct:.2f}%)")
+
+        if heuristic_cost + 1e-6 < optimal_cost:
+            print("ADVERTENCIA: el costo heuristico quedo bajo el optimo; revisar formulacion o restricciones.")
+        elif heuristic_feasible:
+            print("La heuristica es factible y sirve como solucion de referencia para comparar el plan optimo.")
+
+        # Heuristica adicional simple: no usa solver ni busqueda combinatoria.
+        # Cumple minimos y reparte el excedente segun la capacidad remanente de cada destino.
+        print("\nHeuristica simple adicional: reparto proporcional por capacidad remanente")
+        print("Fundamento: se agrega como benchmark operativo de baja complejidad; no requiere optimizacion matematica ni alta demanda computacional.")
+        print("Primero cumple minimos comerciales y luego reparte el excedente proporcionalmente a la capacidad disponible.")
+
+        simple_heuristic_allocations = []
+        simple_heuristic_cost = 0.0
+        simple_heuristic_feasible = True
+
+        for p in products:
+            product_supply = production[p]
+            product_bounds = bounds_dict[p]
+            min_required = sum(lb for lb, _ in product_bounds.values())
+            remaining_volume = product_supply - min_required
+
+            if remaining_volume < -1e-6:
+                print(f"ADVERTENCIA: {p} no alcanza los minimos para la heuristica proporcional.")
+                simple_heuristic_feasible = False
+                continue
+
+            remaining_capacities = {
+                d: upper_bound - lower_bound
+                for d, (lower_bound, upper_bound) in product_bounds.items()
+            }
+            total_remaining_capacity = sum(remaining_capacities.values())
+
+            if remaining_volume > total_remaining_capacity + 1e-6:
+                print(f"ADVERTENCIA: {p} supera la capacidad disponible para la heuristica proporcional.")
+                simple_heuristic_feasible = False
+                continue
+
+            for d, (lower_bound, _) in product_bounds.items():
+                proportional_extra = (
+                    remaining_volume * remaining_capacities[d] / total_remaining_capacity
+                    if total_remaining_capacity > 0 else 0
+                )
+                assigned_volume = lower_bound + proportional_extra
+                route_cost = assigned_volume * 100 * distances[d]
+                simple_heuristic_cost += route_cost
+
+                if assigned_volume > 0.01:
+                    simple_heuristic_allocations.append({
+                        'Producto': p,
+                        'Destino': d,
+                        'Volumen_m3': assigned_volume,
+                        'Distancia_km': distances[d],
+                        'Costo_CLP': route_cost,
+                    })
+
+        if simple_heuristic_allocations:
+            simple_heuristic_plan = pd.DataFrame(simple_heuristic_allocations)
+            print("\nPlan heuristico proporcional:")
+            print(simple_heuristic_plan.to_string(
+                index=False,
+                formatters={
+                    'Volumen_m3': '{:,.2f}'.format,
+                    'Distancia_km': '{:.1f}'.format,
+                    'Costo_CLP': '$ {:,.0f}'.format,
+                }
+            ))
+
+            simple_totals = simple_heuristic_plan.groupby('Producto')['Volumen_m3'].sum()
+            for p in products:
+                shipped_volume = simple_totals.get(p, 0.0)
+                if abs(shipped_volume - production[p]) > 1e-4:
+                    print(f"ADVERTENCIA: La heuristica proporcional envio {shipped_volume:,.2f} m3 de {p}, pero la produccion es {production[p]:,.2f} m3.")
+                    simple_heuristic_feasible = False
+
+            for _, row in simple_heuristic_plan.iterrows():
+                lower_bound, upper_bound = bounds_dict[row['Producto']][row['Destino']]
+                if row['Volumen_m3'] < lower_bound - 1e-4 or row['Volumen_m3'] > upper_bound + 1e-4:
+                    print(
+                        f"ADVERTENCIA: La heuristica proporcional viola limites en {row['Producto']} - {row['Destino']} "
+                        f"({row['Volumen_m3']:,.2f} m3 fuera de [{lower_bound:,.2f}, {upper_bound:,.2f}])."
+                    )
+                    simple_heuristic_feasible = False
+
+            simple_cost_difference = simple_heuristic_cost - optimal_cost
+            simple_gap_pct = (simple_cost_difference / optimal_cost) * 100 if optimal_cost > 0 else 0
+
+            print("-" * 50)
+            print(f"COSTO HEURISTICO PROPORCIONAL: $ {simple_heuristic_cost:,.0f} CLP")
+            print(f"COSTO OPTIMO: $ {optimal_cost:,.0f} CLP")
+            print(f"DIFERENCIA PROPORCIONAL - OPTIMO: $ {simple_cost_difference:,.0f} CLP ({simple_gap_pct:.2f}%)")
+
+            if simple_heuristic_cost + 1e-6 < optimal_cost:
+                print("ADVERTENCIA: el costo proporcional quedo bajo el optimo; revisar formulacion o restricciones.")
+            elif simple_heuristic_feasible:
+                print("La heuristica proporcional es factible y muestra el costo de una politica simple que no prioriza distancia.")
+    else:
+        print("No se pudo construir un plan heuristico de referencia.")
 else:
     print("Error: El modelo logístico no encontró solución factible.", res.message)
